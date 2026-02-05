@@ -237,8 +237,9 @@ async function getChainBalance(user, chain) {
       try {
         const tonapiKey = process.env.TONAPI_KEY || "";
         const res = await axios.get(`https://tonapi.io/v2/accounts/${entry.address}`, { headers: tonapiKey ? { "x-api-key": tonapiKey } : {} });
-        if (res.data && res.data.balance) {
-          const ton = Number(res.data.balance);
+        if (res.data && typeof res.data.balance !== "undefined") {
+          const nano = BigInt(res.data.balance || "0");
+          const ton = Number(nano) / 1e9;
           return String(ton);
         }
       } catch (e) {
@@ -354,8 +355,8 @@ async function scanTONTokens(address) {
       // also add native TON if returned by API (tonapi returns native balance separately)
       try {
         const acct = await axios.get(`https://tonapi.io/v2/accounts/${address}`, { headers });
-        if (acct.data && acct.data.balance) {
-          const tonBal = Number(acct.data.balance);
+        if (acct.data && typeof acct.data.balance !== "undefined") {
+          const tonBal = Number(BigInt(acct.data.balance || "0")) / 1e9;
           if (tonBal > 0) out.unshift({ symbol: "TON", balance: tonBal, address: null });
         }
       } catch (_) {}
@@ -467,6 +468,14 @@ async function sendTONNative(privateKeyHex, toAddress, amountTon) {
  *
  * This is a non-trivial operation and MUST be tested on small amounts.
  */
+function decimalToBigInt(value, decimals) {
+  const s = String(value).trim();
+  if (!/^\d+(\.\d+)?$/.test(s)) throw new Error("Invalid amount");
+  const [whole, frac = ""] = s.split(".");
+  const fracPadded = (frac + "0".repeat(decimals)).slice(0, decimals);
+  return BigInt(whole + fracPadded);
+}
+
 async function sendTonJetton(privateKeyHex, recipientTonAddress, amount, jettonMaster) {
   if (!TonWeb) throw new Error("tonweb required");
   if (!CHAIN_CONFIG.ton.rpc) throw new Error("TON_RPC not configured");
@@ -541,62 +550,37 @@ async function sendTonJetton(privateKeyHex, recipientTonAddress, amount, jettonM
     console.debug("Unable to fetch jetton decimals, using default 9:", e?.message || e);
   }
 
-  const amountSmallest = BigInt(Math.floor(amount * (10 ** decimals)));
+  const amountSmallest = decimalToBigInt(amount, decimals);
 
-  // Build transfer message using JettonWallet contract
+  // Build transfer body and send internal message via user's wallet
   try {
-    if (!JettonWallet) throw new Error("JettonWallet helper not found in TonWeb");
-    const senderJetton = new JettonWallet(tonweb.provider, { address: senderJettonWalletAddress });
-    // create transfer body payload (TonWeb JettonWallet often exposes 'transfer' builder)
-    // Some versions: senderJetton.methods.transfer({ amount: amountSmallest, recipient: recipientJettonWalletAddress, forwardPayload: null }).send({ secretKey })
-    if (senderJetton.methods && typeof senderJetton.methods.transfer === "function") {
-      // Note: method signature depends on TonWeb version; adapt if necessary
-      const params = {
-        secretKey,
-        toAddress: recipientJettonWalletAddress,
-        amount: amountSmallest.toString()
-      };
-      // If JettonWallet.transfer requires a wallet, we need to send via user's wallet internal transfer message to the jetton wallet contract
-      // Simpler approach: call sender wallet to send an internal message to the senderJettonWalletAddress with transfer payload
+    if (!TonWeb.token || !TonWeb.token.jetton || !TonWeb.token.jetton.JettonWalletContract) {
+      throw new Error("JettonWalletContract not available in this TonWeb version");
     }
-  } catch (e) {
-    // fallback approach: construct payload and send internal message via user's wallet.transfer
-    // Create transfer body manually according to Jetton standard
-    // We'll build a simple payload that calls 'transfer' on the jetton wallet using TonWeb.Contract and send via wallet
-    try {
-      // Build transfer body using TonWeb contract composer
-      // This is a complex area — we attempt a common approach:
-      const senderJettonContract = new TonWeb.Contract(tonweb.provider, TonWeb.token.jetton.JettonWalletContract, { address: senderJettonWalletAddress });
-      // Usually JettonWalletContract has methods.transfer.createTransferBody(...)
-      // But due to TonWeb version differences, we'll instead use JettonWalletContract to call 'transfer' via wallet internal message.
-      // Construct transfer body via the JettonWalletContract.createTransferBody if available:
-      let transferBody;
-      if (typeof TonWeb.token.jetton.JettonWalletContract.createTransferBody === "function") {
-        transferBody = TonWeb.token.jetton.JettonWalletContract.createTransferBody({
-          amount: amountSmallest.toString(),
-          to: recipientJettonWalletAddress,
-          forwardAmount: "0",
-          forwardPayload: null
-        });
-      } else {
-        // As last resort, craft a simple internal message: calling 'transfer' using empty payload - may not work
-        throw new Error("JettonWalletContract.createTransferBody not available in your TonWeb version");
-      }
+    if (typeof TonWeb.token.jetton.JettonWalletContract.createTransferBody !== "function") {
+      throw new Error("JettonWalletContract.createTransferBody not available in this TonWeb version");
+    }
 
-      // Now use user's wallet to send internal message to senderJettonWalletAddress with body = transferBody
-      const wallet = new WalletClass(tonweb.provider, { publicKey: keyPair.publicKey });
-      const seqno = (await wallet.methods.seqno().call()) || 0;
-      const tx = await wallet.methods.transfer({
-        secretKey,
-        toAddress: senderJettonWalletAddress,
-        amount: TonWeb.utils.toNano("0.02"), // small amount to cover gas and forward
-        seqno,
-        payload: transferBody
-      }).send();
-      return tx;
-    } catch (innerErr) {
-      throw new Error("Jetton transfer failed (detailed): " + (innerErr?.message || innerErr));
-    }
+    const transferBody = TonWeb.token.jetton.JettonWalletContract.createTransferBody({
+      amount: amountSmallest.toString(),
+      to: recipientJettonWalletAddress,
+      responseAddress: senderAddress,
+      forwardAmount: "0",
+      forwardPayload: null
+    });
+
+    const wallet = new WalletClass(tonweb.provider, { publicKey: keyPair.publicKey });
+    const seqno = (await wallet.methods.seqno().call()) || 0;
+    const tx = await wallet.methods.transfer({
+      secretKey,
+      toAddress: senderJettonWalletAddress,
+      amount: TonWeb.utils.toNano("0.02"),
+      seqno,
+      payload: transferBody
+    }).send();
+    return tx;
+  } catch (innerErr) {
+    throw new Error("Jetton transfer failed (detailed): " + (innerErr?.message || innerErr));
   }
 }
 

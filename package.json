@@ -1,0 +1,26 @@
+{
+  "name": "novacard-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "body-parser": "^2.2.1",
+    "crypto": "^1.0.1",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.16.0",
+    "express": "^5.2.1",
+    "mongodb": "^7.0.0",
+    "mongoose": "^8.20.2",
+    "node-fetch": "^3.3.2",
+    "node-telegram-bot-api": "^0.66.0",
+    "openai": "^6.8.1",
+    "tonweb": "^0.0.66"
+  }
+}
