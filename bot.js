@@ -39,6 +39,9 @@ if (!BOT_TOKEN) {
 const ENCRYPTION_SECRET = process.env.ENCRYPTION_SECRET || "change_this_secret";
 const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || "1", 10);
 const WEBHOOK_PORT = parseInt(process.env.PORT || "3000", 10);
+const TON_NATIVE_FEE_NANO = BigInt(10000000); // 0.01 TON
+const TON_JETTON_FORWARD_NANO = BigInt(20000000); // 0.02 TON
+const TON_JETTON_GAS_BUFFER_NANO = BigInt(5000000); // 0.005 TON
 
 // Chain config (tonscan explorer set for TON)
 const CHAIN_CONFIG = {
@@ -119,6 +122,7 @@ const walletSubSchema = new mongoose.Schema({
 
 const userSchema = new mongoose.Schema({
   telegramId: { type: String, index: true, unique: true },
+  whatsappNumber: { type: String, index: true, unique: true, sparse: true },
   username: String,
   firstName: String,
   createdAt: { type: Date, default: Date.now },
@@ -146,15 +150,22 @@ const txSchema = new mongoose.Schema({
 const Tx = mongoose.model("Tx", txSchema);
 
 // ---------- In-memory flow stores ----------
-const sendState = {};     // send flows
-const pinSessions = {};   // pin entry flows
-const pinSetSessions = {}; // setpin flows
+const sendState = {};     // telegram send flows
+const pinSessions = {};   // telegram pin entry flows
+const pinSetSessions = {}; // telegram setpin flows
+const sendStateWA = {};   // whatsapp send flows
+const pinSessionsWA = {}; // whatsapp pin entry flows
+const pinSetSessionsWA = {}; // whatsapp setpin flows
 
 // ---------- Helpers ----------
 function shortAddr(addr) { if (!addr) return "—"; return `${addr.slice(0,6)}...${addr.slice(-4)}`; }
 function explorerLink(chain, txHash) { if (!txHash) return ""; return `${CHAIN_CONFIG[chain].explorer}${txHash}`; }
 function sendSafeError(chatId) { return bot.sendMessage(chatId, "⚠️ Something went wrong — try again later."); }
 function isValidChain(chain) { return SUPPORTED_CHAINS.includes(chain); }
+function isValidTonAddress(addr) {
+  if (!TonWeb || !TonWeb.utils || !TonWeb.utils.Address) return false;
+  try { new TonWeb.utils.Address(addr); return true; } catch (_) { return false; }
+}
 
 // ---------- PIN helpers ----------
 function hashPIN(pin) { return crypto.createHash("sha256").update(pin).digest("hex"); }
@@ -174,6 +185,20 @@ async function requestPINForAction(telegramId, chatId, action, params = {}) {
 }
 function clearPinSession(telegramId) { if (pinSessions[telegramId]) delete pinSessions[telegramId]; }
 
+async function requestPINForActionWhatsApp(whatsappNumber, action, params = {}) {
+  const user = await User.findOne({ whatsappNumber });
+  if (!user) return sendWhatsAppText(whatsappNumber, "User record missing.");
+  if (user.pinLockedUntil && new Date(user.pinLockedUntil) > new Date()) {
+    const mins = Math.ceil((new Date(user.pinLockedUntil) - Date.now())/60000);
+    return sendWhatsAppText(whatsappNumber, `🔒 Too many wrong attempts. Try again in ${mins} minute(s).`);
+  }
+  if (!user.pinHash) {
+    return sendWhatsAppText(whatsappNumber, "🔐 You must set a PIN first. Send `setpin`.");
+  }
+  await sendWhatsAppText(whatsappNumber, "🔐 Enter your 4–6 digit PIN:");
+  pinSessionsWA[whatsappNumber] = { action, params };
+}
+
 // ---------- Wallet helpers ----------
 async function getOrCreateUser(from) {
   const telegramId = String(from.id);
@@ -183,6 +208,15 @@ async function getOrCreateUser(from) {
     console.log("Created user", telegramId);
   } else {
     if (from.username && user.username !== from.username) { user.username = from.username; await user.save(); }
+  }
+  return user;
+}
+
+async function getOrCreateWhatsAppUser(whatsappNumber) {
+  let user = await User.findOne({ whatsappNumber });
+  if (!user) {
+    user = await User.create({ whatsappNumber, username: "", firstName: "" });
+    console.log("Created WhatsApp user", whatsappNumber);
   }
   return user;
 }
@@ -382,6 +416,35 @@ async function scanTONTokens(address) {
   return out;
 }
 
+async function getTonNanoBalance(address) {
+  if (!CHAIN_CONFIG.ton.rpc) throw new Error("TON RPC not configured");
+  try {
+    const tonapiKey = process.env.TONAPI_KEY || "";
+    const res = await axios.get(`https://tonapi.io/v2/accounts/${address}`, { headers: tonapiKey ? { "x-api-key": tonapiKey } : {} });
+    if (res.data && typeof res.data.balance !== "undefined") {
+      return BigInt(res.data.balance || "0");
+    }
+  } catch (_) {}
+  const payload = { jsonrpc: "2.0", id: 1, method: "getAccount", params: { account: address } };
+  const res = await axios.post(CHAIN_CONFIG.ton.rpc, payload, { headers: { "Content-Type": "application/json" } });
+  if (res.data && res.data.result && typeof res.data.result.balance !== "undefined") {
+    return BigInt(res.data.result.balance || "0");
+  }
+  return null;
+}
+
+async function getJettonDecimals(jettonMaster) {
+  let decimals = 9;
+  try {
+    const tonapiKey = process.env.TONAPI_KEY || "";
+    const metaRes = await axios.get(`https://tonapi.io/v2/jettons/${jettonMaster}`, { headers: tonapiKey ? { "x-api-key": tonapiKey } : {} });
+    if (metaRes.data && metaRes.data.metadata && typeof metaRes.data.metadata.decimals !== "undefined") {
+      decimals = Number(metaRes.data.metadata.decimals);
+    }
+  } catch (_) {}
+  return decimals;
+}
+
 // ---------- Gas estimation (EVM) and simple TON placeholder fee ----------
 async function estimateGasForTransfer(chain, fromAddress, toAddress, amount, tokenAddress = null) {
   if (!isValidChain(chain)) throw new Error("Unsupported chain");
@@ -476,6 +539,102 @@ function decimalToBigInt(value, decimals) {
   return BigInt(whole + fracPadded);
 }
 
+async function getJettonBalanceNano(ownerAddress, jettonMaster) {
+  if (!TonWeb) throw new Error("tonweb required");
+  if (!CHAIN_CONFIG.ton.rpc) throw new Error("TON_RPC not configured");
+  const tonweb = new TonWeb(tonwebProvider || new TonWeb.HttpProvider(CHAIN_CONFIG.ton.rpc));
+  const JettonMinter = TonWeb.token?.jetton?.JettonMinter;
+  const JettonWallet = TonWeb.token?.jetton?.JettonWallet;
+  if (!JettonMinter || !JettonWallet) throw new Error("Jetton helpers not available in this TonWeb version");
+
+  const minter = new JettonMinter(tonweb.provider, { address: jettonMaster });
+  const ownerAddr = new TonWeb.utils.Address(ownerAddress);
+  const jettonWalletAddress = await minter.getJettonWalletAddress(ownerAddr);
+  const wallet = new JettonWallet(tonweb.provider, { address: jettonWalletAddress });
+  const data = await wallet.getData();
+  return BigInt(data.balance.toString());
+}
+
+async function askCenAI(prompt) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error("OpenAI key missing");
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: "You are Cen AI." },
+        { role: "user", content: prompt }
+      ],
+      max_tokens: 600
+    })
+  });
+  const j = await res.json();
+  if (!j.choices || !j.choices[0]) throw new Error("OpenAI no response");
+  return j.choices[0].message.content;
+}
+
+async function executeWhatsAppSend(user, s) {
+  const chain = s.chain;
+  const toAddr = s.recipient;
+  if (!isValidChain(chain)) throw new Error("Unsupported chain");
+  if (chain !== "ton" && (!toAddr || !ethers.isAddress(toAddr))) throw new Error("Invalid recipient address");
+  if (chain === "ton" && !isValidTonAddress(toAddr)) throw new Error("Invalid TON address");
+
+  if (chain === "ton") {
+    const entry = user.wallets.get("ton");
+    if (!entry) throw new Error("Sender has no TON wallet");
+    const priv = decryptPrivateKey(entry.privateKeyEnc);
+    if (!s.tokenAddress) {
+      const balanceNano = await getTonNanoBalance(entry.address);
+      const amountNano = decimalToBigInt(s.amount, 9);
+      if (balanceNano !== null && balanceNano < (amountNano + TON_NATIVE_FEE_NANO)) {
+        throw new Error("Insufficient TON balance to cover amount and fees");
+      }
+      const res = await sendTONNative(priv, toAddr, s.amount);
+      return `✅ Sent ${s.amount} TON (native). Explorer: ${CHAIN_CONFIG.ton.explorer}${res?.transactionHash || ""}`;
+    }
+
+    const tonBalanceNano = await getTonNanoBalance(entry.address);
+    const minTonNeeded = TON_JETTON_FORWARD_NANO + TON_JETTON_GAS_BUFFER_NANO;
+    if (tonBalanceNano !== null && tonBalanceNano < minTonNeeded) {
+      throw new Error("Insufficient TON balance to cover jetton transfer fees");
+    }
+    const jettonDecimals = await getJettonDecimals(s.tokenAddress);
+    const jettonAmountSmallest = decimalToBigInt(s.amount, jettonDecimals);
+    const jettonBalance = await getJettonBalanceNano(entry.address, s.tokenAddress);
+    if (jettonBalance < jettonAmountSmallest) {
+      throw new Error(`Insufficient ${s.tokenSymbol || "JETTON"} balance`);
+    }
+    await sendTonJetton(priv, toAddr, s.amount, s.tokenAddress);
+    return `✅ Sent ${s.amount} ${s.tokenSymbol || "JETTON"} (TON). Explorer: ${CHAIN_CONFIG.ton.explorer}`;
+  }
+
+  // EVM native / ERC20
+  const entry = user.wallets.get(chain);
+  const pk = decryptPrivateKey(entry.privateKeyEnc);
+  const provider = providers[chain];
+  if (!provider) throw new Error("Provider not configured");
+  if (!s.tokenAddress) {
+    const wallet = new ethers.Wallet(pk, provider);
+    const tx = await wallet.sendTransaction({ to: toAddr, value: ethers.parseEther(String(s.amount)) });
+    const receipt = await tx.wait(CONFIRMATIONS);
+    await Tx.create({ userId: user.telegramId || user.whatsappNumber, from: entry.address, to: toAddr, amount: String(s.amount), token: "NATIVE", txHash: tx.hash, chain, status: receipt?.status === 1 ? "confirmed" : "failed" });
+    return `✅ Sent ${s.amount} ${CHAIN_CONFIG[chain].symbol}\nTx: ${tx.hash}\n${explorerLink(chain, tx.hash)}`;
+  } else {
+    const signer = new ethers.Wallet(pk, provider);
+    const tokenContract = new ethers.Contract(s.tokenAddress, ERC20_ABI, signer);
+    let decimals = 18;
+    try { decimals = await tokenContract.decimals(); } catch (_) {}
+    const parsed = ethers.parseUnits(String(s.amount), decimals);
+    const tx = await tokenContract.transfer(toAddr, parsed);
+    const receipt = await tx.wait(CONFIRMATIONS);
+    await Tx.create({ userId: user.telegramId || user.whatsappNumber, from: entry.address, to: toAddr, amount: String(s.amount), token: s.tokenSymbol || "ERC20", txHash: tx.hash, chain, status: receipt?.status === 1 ? "confirmed" : "failed" });
+    return `✅ Sent ${s.amount} ${s.tokenSymbol || "TOKEN"}\nTx: ${tx.hash}\n${explorerLink(chain, tx.hash)}`;
+  }
+}
+
 async function sendTonJetton(privateKeyHex, recipientTonAddress, amount, jettonMaster) {
   if (!TonWeb) throw new Error("tonweb required");
   if (!CHAIN_CONFIG.ton.rpc) throw new Error("TON_RPC not configured");
@@ -492,80 +651,29 @@ async function sendTonJetton(privateKeyHex, recipientTonAddress, amount, jettonM
   if (!TonWeb.token || !TonWeb.token.jetton) {
     throw new Error("TonWeb token.jetton helper not available in this tonweb version");
   }
-  const JettonMaster = TonWeb.token.jetton.JettonMaster || TonWeb.token.jetton.JettonMasterContract || TonWeb.token.jetton;
-  const JettonWallet = TonWeb.token.jetton.JettonWallet || TonWeb.token.jetton.JettonWalletContract || TonWeb.token.jetton;
-
-  // compute sender's jetton wallet address (deterministic)
-  // TonWeb often exposes: tonweb.token.jetton.jettonWalletAddress(masterAddress, ownerAddress)
-  let senderJettonWalletAddress;
-  try {
-    if (typeof TonWeb.token.jetton.jettonWalletAddress === "function") {
-      senderJettonWalletAddress = await TonWeb.token.jetton.jettonWalletAddress(jettonMaster, senderAddress);
-    } else if (JettonWallet && JettonWallet.getAddress) {
-      // instantiate
-      const jWallet = new JettonWallet(tonweb.provider, { master: jettonMaster, owner: senderAddress });
-      senderJettonWalletAddress = (await jWallet.getAddress()).toString(true, true, true);
-    } else {
-      throw new Error("Cannot determine jetton wallet address - TonWeb helper not found");
-    }
-  } catch (e) {
-    throw new Error("Failed to compute sender jetton wallet address: " + (e?.message || e));
+  const JettonMinter = TonWeb.token.jetton.JettonMinter;
+  const JettonWallet = TonWeb.token.jetton.JettonWallet;
+  if (!JettonMinter || !JettonWallet) {
+    throw new Error("Jetton helpers not available in this TonWeb version");
   }
 
-  // Similarly compute recipient jetton wallet address (destination)
-  let recipientJettonWalletAddress;
-  try {
-    if (typeof TonWeb.token.jetton.jettonWalletAddress === "function") {
-      recipientJettonWalletAddress = await TonWeb.token.jetton.jettonWalletAddress(jettonMaster, recipientTonAddress);
-    } else if (JettonWallet && JettonWallet.getAddress) {
-      const rWallet = new JettonWallet(tonweb.provider, { master: jettonMaster, owner: recipientTonAddress });
-      recipientJettonWalletAddress = (await rWallet.getAddress()).toString(true, true, true);
-    } else {
-      throw new Error("Cannot determine recipient jetton wallet address - TonWeb helper not found");
-    }
-  } catch (e) {
-    throw new Error("Failed to compute recipient jetton wallet address: " + (e?.message || e));
-  }
+  const minter = new JettonMinter(tonweb.provider, { address: jettonMaster });
+  const senderJettonWalletAddress = await minter.getJettonWalletAddress(new TonWeb.utils.Address(senderAddress));
+  const recipientJettonWalletAddress = await minter.getJettonWalletAddress(new TonWeb.utils.Address(recipientTonAddress));
 
-  // Prepare transfer payload: usually call transfer(token_amount, recipient_jetton_wallet_address, maybe forward_payload)
-  // Use JettonWallet contract instance to call 'transfer' with amount in smallest units.
-  // Need decimals: fetch jetton metadata if possible
-  // We'll attempt to instantiate JettonMaster and fetch decimals
-  let decimals = 9; // default
-  try {
-    if (JettonMaster && typeof JettonMaster.getDecimals === "function") {
-      // hypothetical: some versions expose helper to fetch metadata
-      const jm = new JettonMaster(tonweb.provider, { address: jettonMaster });
-      decimals = Number(await jm.getDecimals());
-    } else {
-      // fallback: attempt TonAPI metadata fetch
-      try {
-        const metaRes = await axios.get(`https://tonapi.io/v2/jettons/${jettonMaster}`);
-        if (metaRes.data && metaRes.data.metadata && typeof metaRes.data.metadata.decimals !== "undefined") {
-          decimals = Number(metaRes.data.metadata.decimals);
-        }
-      } catch (e) {}
-    }
-  } catch (e) {
-    console.debug("Unable to fetch jetton decimals, using default 9:", e?.message || e);
-  }
+  let decimals = 9;
+  try { decimals = await getJettonDecimals(jettonMaster); } catch (_) {}
 
   const amountSmallest = decimalToBigInt(amount, decimals);
 
   // Build transfer body and send internal message via user's wallet
   try {
-    if (!TonWeb.token || !TonWeb.token.jetton || !TonWeb.token.jetton.JettonWalletContract) {
-      throw new Error("JettonWalletContract not available in this TonWeb version");
-    }
-    if (typeof TonWeb.token.jetton.JettonWalletContract.createTransferBody !== "function") {
-      throw new Error("JettonWalletContract.createTransferBody not available in this TonWeb version");
-    }
-
-    const transferBody = TonWeb.token.jetton.JettonWalletContract.createTransferBody({
-      amount: amountSmallest.toString(),
-      to: recipientJettonWalletAddress,
-      responseAddress: senderAddress,
-      forwardAmount: "0",
+    const senderJettonWallet = new JettonWallet(tonweb.provider, { address: senderJettonWalletAddress });
+    const transferBody = await senderJettonWallet.createTransferBody({
+      jettonAmount: new TonWeb.utils.BN(amountSmallest.toString()),
+      toAddress: recipientJettonWalletAddress,
+      responseAddress: new TonWeb.utils.Address(senderAddress),
+      forwardAmount: new TonWeb.utils.BN(0),
       forwardPayload: null
     });
 
@@ -573,8 +681,8 @@ async function sendTonJetton(privateKeyHex, recipientTonAddress, amount, jettonM
     const seqno = (await wallet.methods.seqno().call()) || 0;
     const tx = await wallet.methods.transfer({
       secretKey,
-      toAddress: senderJettonWalletAddress,
-      amount: TonWeb.utils.toNano("0.02"),
+      toAddress: senderJettonWalletAddress.toString(true, true, true),
+      amount: new TonWeb.utils.BN(TON_JETTON_FORWARD_NANO.toString()),
       seqno,
       payload: transferBody
     }).send();
@@ -794,6 +902,7 @@ bot.on("callback_query", async (query) => {
       }
       // Validate non-TON addresses with ethers.isAddress
       if (chain !== "ton" && (!toAddr || !ethers.isAddress(toAddr))) { delete sendState[telegramId]; return bot.sendMessage(chatId, "❌ Invalid recipient address."); }
+      if (chain === "ton" && !isValidTonAddress(toAddr)) { delete sendState[telegramId]; return bot.sendMessage(chatId, "❌ Invalid TON address."); }
 
       try {
         if (chain === "ton") {
@@ -805,6 +914,12 @@ bot.on("callback_query", async (query) => {
           if (!s.tokenAddress) {
             // native TON send
             try {
+              const balanceNano = await getTonNanoBalance(entry.address);
+              const amountNano = decimalToBigInt(s.amount, 9);
+              if (balanceNano !== null && balanceNano < (amountNano + TON_NATIVE_FEE_NANO)) {
+                delete sendState[telegramId];
+                return bot.sendMessage(chatId, "❌ Insufficient TON balance to cover amount and fees.");
+              }
               const res = await sendTONNative(priv, toAddr, s.amount);
               delete sendState[telegramId];
               // Note: Ton transfer result format depends on provider; use explorer to view.
@@ -819,6 +934,19 @@ bot.on("callback_query", async (query) => {
           } else {
             // Jetton transfer
             try {
+              const tonBalanceNano = await getTonNanoBalance(entry.address);
+              const minTonNeeded = TON_JETTON_FORWARD_NANO + TON_JETTON_GAS_BUFFER_NANO;
+              if (tonBalanceNano !== null && tonBalanceNano < minTonNeeded) {
+                delete sendState[telegramId];
+                return bot.sendMessage(chatId, "❌ Insufficient TON balance to cover jetton transfer fees.");
+              }
+              const jettonDecimals = await getJettonDecimals(s.tokenAddress);
+              const jettonAmountSmallest = decimalToBigInt(s.amount, jettonDecimals);
+              const jettonBalance = await getJettonBalanceNano(entry.address, s.tokenAddress);
+              if (jettonBalance < jettonAmountSmallest) {
+                delete sendState[telegramId];
+                return bot.sendMessage(chatId, `❌ Insufficient ${s.tokenSymbol || "JETTON"} balance.`);
+              }
               const jettonMaster = s.tokenAddress; // Jetton master contract (EQ... address)
               const res = await sendTonJetton(priv, toAddr, s.amount, jettonMaster);
               delete sendState[telegramId];
@@ -1000,18 +1128,7 @@ bot.on("message", async (msg) => {
     if (user.state === "awaiting_ai_query") {
       user.state = null; await user.save();
       try {
-        const response = await (async (prompt) => {
-          const key = process.env.OPENAI_API_KEY;
-          if (!key) throw new Error("OpenAI key missing");
-          const res = await fetch("https://api.openai.com/v1/chat/completions", {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-            body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "system", content: "You are Cen AI." }, { role: "user", content: prompt }], max_tokens: 600 })
-          });
-          const j = await res.json();
-          if (!j.choices || !j.choices[0]) throw new Error("OpenAI no response");
-          return j.choices[0].message.content;
-        })(text);
+        const response = await askCenAI(text);
         return bot.sendMessage(chatId, `🧠 Cen AI:\n\n${response}`);
       } catch (e) { console.error("AI error", e); return sendSafeError(chatId); }
     }
@@ -1032,7 +1149,7 @@ bot.on("message", async (msg) => {
       } else {
         if (s.chain !== "ton" && !ethers.isAddress(input)) return bot.sendMessage(chatId, "❌ Invalid address.");
         // TON addresses are flexible; basic check: non-empty
-        if (s.chain === "ton" && (!input || input.length < 10)) return bot.sendMessage(chatId, "❌ Invalid TON address.");
+        if (s.chain === "ton" && !isValidTonAddress(input)) return bot.sendMessage(chatId, "❌ Invalid TON address.");
         s.recipient = input;
         s.step = "askTokenChoice";
         return bot.sendMessage(chatId, "Do you want to send `native` or `token`? Reply `native` or `token`.");
@@ -1073,6 +1190,7 @@ bot.on("message", async (msg) => {
         return bot.sendMessage(chatId, `Enter amount in ${s.tokenSymbol} (e.g., 10.5)`);
       }
       if (s.chain === "ton") {
+        if (!isValidTonAddress(text)) return bot.sendMessage(chatId, "❌ Invalid jetton address.");
         s.tokenAddress = text; s.tokenSymbol = "JETTON"; s.step = "askAmount";
         return bot.sendMessage(chatId, `Enter amount in ${s.tokenSymbol} (e.g., 10.5)`);
       }
@@ -1124,7 +1242,421 @@ bot.on("message", async (msg) => {
 });
 
 // ---------- Express health ----------
+// ---------- WhatsApp webhook (reuses wallet helpers) ----------
+async function sendWhatsAppText(to, message) {
+  const phoneId = process.env.WHATSAPP_PHONE_ID;
+  const token = process.env.WHATSAPP_TOKEN;
+  if (!phoneId || !token) throw new Error("Missing WHATSAPP_PHONE_ID or WHATSAPP_TOKEN");
+  const url = `https://graph.facebook.com/v16.0/${phoneId}/messages`;
+  const body = {
+    messaging_product: "whatsapp",
+    to,
+    text: { body: message }
+  };
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify(body)
+  });
+  return r.json();
+}
+
+async function sendWhatsAppMenu(to) {
+  const phoneId = process.env.WHATSAPP_PHONE_ID;
+  const token = process.env.WHATSAPP_TOKEN;
+  if (!phoneId || !token) throw new Error("Missing WHATSAPP_PHONE_ID or WHATSAPP_TOKEN");
+  const url = `https://graph.facebook.com/v16.0/${phoneId}/messages`;
+  const body = {
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "list",
+      header: { type: "text", text: "CenDeFi Menu" },
+      body: { text: "Choose an action:" },
+      footer: { text: "Tip: You can still type commands." },
+      action: {
+        button: "Open Menu",
+        sections: [
+          {
+            title: "Wallet",
+            rows: [
+              { id: "menu_createwallet", title: "Create Wallets", description: "Create wallets on supported chains" },
+              { id: "menu_balance", title: "Balance", description: "Check balance on a chain" },
+              { id: "menu_address", title: "Address", description: "Get your receive address" }
+            ]
+          },
+          {
+            title: "Send",
+            rows: [
+              { id: "menu_send", title: "Send Funds", description: "Choose chain then send" },
+              { id: "menu_send_polygon", title: "Send on Polygon", description: "MATIC / tokens" },
+              { id: "menu_send_bsc", title: "Send on BSC", description: "BNB / tokens" },
+              { id: "menu_send_base", title: "Send on Base", description: "ETH / tokens" },
+              { id: "menu_send_ethereum", title: "Send on Ethereum", description: "ETH / tokens" },
+              { id: "menu_send_ton", title: "Send on TON", description: "TON / jettons" },
+              { id: "menu_setpin", title: "Set PIN", description: "Protect sends with a PIN" }
+            ]
+          },
+          {
+            title: "AI",
+            rows: [
+              { id: "menu_ask", title: "Ask Cen AI", description: "Ask a question" }
+            ]
+          }
+        ]
+      }
+    }
+  };
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify(body)
+  });
+  return r.json();
+}
+
+async function sendWhatsAppButtons(to, bodyText, buttons) {
+  const phoneId = process.env.WHATSAPP_PHONE_ID;
+  const token = process.env.WHATSAPP_TOKEN;
+  if (!phoneId || !token) throw new Error("Missing WHATSAPP_PHONE_ID or WHATSAPP_TOKEN");
+  const url = `https://graph.facebook.com/v16.0/${phoneId}/messages`;
+  const body = {
+    messaging_product: "whatsapp",
+    to,
+    type: "interactive",
+    interactive: {
+      type: "button",
+      body: { text: bodyText },
+      action: {
+        buttons: buttons.map(b => ({ type: "reply", reply: { id: b.id, title: b.title } }))
+      }
+    }
+  };
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify(body)
+  });
+  return r.json();
+}
+
+async function sendWhatsAppMenuButtons(to) {
+  return sendWhatsAppButtons(to, "Quick actions:", [
+    { id: "menu_createwallet", title: "Create Wallet" },
+    { id: "menu_balance", title: "Balance" },
+    { id: "menu_address", title: "Address" }
+  ]);
+}
+
+async function sendWhatsAppChainPicker(to) {
+  await sendWhatsAppButtons(to, "Pick a chain to send from:", [
+    { id: "menu_send_polygon", title: "Polygon" },
+    { id: "menu_send_bsc", title: "BSC" },
+    { id: "menu_send_base", title: "Base" }
+  ]);
+  return sendWhatsAppButtons(to, "More chains:", [
+    { id: "menu_send_ethereum", title: "Ethereum" },
+    { id: "menu_send_ton", title: "TON" },
+    { id: "menu_send", title: "Use Default" }
+  ]);
+}
+
+function mapWhatsAppMenuIdToText(id) {
+  switch (id) {
+    case "menu_createwallet": return "createwallet";
+    case "menu_balance": return "balance";
+    case "menu_address": return "address";
+    case "menu_send": return "send";
+    case "menu_send_polygon": return "send polygon";
+    case "menu_send_bsc": return "send bsc";
+    case "menu_send_base": return "send base";
+    case "menu_send_ethereum": return "send ethereum";
+    case "menu_send_ton": return "send ton";
+    case "menu_setpin": return "setpin";
+    case "menu_ask": return "ask";
+    default: return null;
+  }
+}
+
+async function handleWhatsAppText(from, text) {
+  const user = await getOrCreateWhatsAppUser(from);
+  const raw = (text || "").trim();
+  if (!raw) return;
+  const lower = raw.toLowerCase();
+
+  // PIN set flow (WhatsApp)
+  if (pinSetSessionsWA[from]) {
+    const session = pinSetSessionsWA[from];
+    if (session.stage === "verify_old") {
+      if (!/^\d{4,6}$/.test(raw)) return sendWhatsAppText(from, "PIN must be 4-6 digits.");
+      if (hashPIN(raw) !== user.pinHash) return sendWhatsAppText(from, "Incorrect PIN.");
+      session.stage = "enter";
+      pinSetSessionsWA[from] = session;
+      return sendWhatsAppText(from, "Verified. Enter your new 4-6 digit PIN:");
+    }
+    if (session.stage === "enter") {
+      if (!/^\d{4,6}$/.test(raw)) return sendWhatsAppText(from, "PIN must be 4-6 digits.");
+      session.tempPin = raw;
+      session.stage = "confirm";
+      pinSetSessionsWA[from] = session;
+      return sendWhatsAppText(from, "Confirm new PIN (re-enter):");
+    }
+    if (session.stage === "confirm") {
+      if (!session.tempPin || raw !== session.tempPin) {
+        delete pinSetSessionsWA[from];
+        return sendWhatsAppText(from, "PINs did not match. Send 'setpin' again.");
+      }
+      user.pinHash = hashPIN(raw);
+      user.pinAttempts = 0;
+      user.pinLockedUntil = null;
+      await user.save();
+      delete pinSetSessionsWA[from];
+      return sendWhatsAppText(from, "PIN set successfully.");
+    }
+  }
+
+  // PIN entry flow (WhatsApp)
+  if (pinSessionsWA[from]) {
+    const session = pinSessionsWA[from];
+    if (!/^\d{4,6}$/.test(raw)) return sendWhatsAppText(from, "PIN must be 4-6 digits.");
+    if (user.pinLockedUntil && new Date(user.pinLockedUntil) > new Date()) {
+      delete pinSessionsWA[from];
+      const mins = Math.ceil((new Date(user.pinLockedUntil) - Date.now())/60000);
+      return sendWhatsAppText(from, `Locked. Try again in ${mins} minutes.`);
+    }
+    if (hashPIN(raw) !== user.pinHash) {
+      user.pinAttempts = (user.pinAttempts || 0) + 1;
+      if (user.pinAttempts >= 5) {
+        user.pinLockedUntil = new Date(Date.now() + 5*60*1000);
+        user.pinAttempts = 0;
+        await user.save();
+        delete pinSessionsWA[from];
+        return sendWhatsAppText(from, "Too many wrong attempts. Locked for 5 minutes.");
+      } else {
+        await user.save();
+        return sendWhatsAppText(from, "Incorrect PIN. Try again.");
+      }
+    }
+    user.pinAttempts = 0;
+    await user.save();
+    delete pinSessionsWA[from];
+
+    if (session.action === "wa_send_confirm") {
+      const s = sendStateWA[from];
+      if (!s) return sendWhatsAppText(from, "No active send session.");
+      try {
+        const msg = await executeWhatsAppSend(user, s);
+        delete sendStateWA[from];
+        return sendWhatsAppText(from, msg);
+      } catch (e) {
+        delete sendStateWA[from];
+        return sendWhatsAppText(from, `Send failed: ${e?.message || e}`);
+      }
+    }
+
+    return sendWhatsAppText(from, "PIN accepted.");
+  }
+
+  // Send flow (WhatsApp)
+  if (sendStateWA[from]) {
+    const s = sendStateWA[from];
+    if (s.step === "askRecipient") {
+      if (s.chain !== "ton" && !ethers.isAddress(raw)) return sendWhatsAppText(from, "Invalid address.");
+      if (s.chain === "ton" && !isValidTonAddress(raw)) return sendWhatsAppText(from, "Invalid TON address.");
+      s.recipient = raw;
+      s.step = "askTokenChoice";
+      return sendWhatsAppText(from, "Do you want to send 'native' or 'token'? Reply native or token.");
+    }
+    if (s.step === "askTokenChoice") {
+      if (lower === "native") {
+        s.tokenAddress = null;
+        s.tokenSymbol = CHAIN_CONFIG[s.chain].symbol;
+        s.step = "askAmount";
+        return sendWhatsAppText(from, `Enter amount in ${s.tokenSymbol} (e.g., 0.1)`);
+      }
+      if (lower === "token") {
+        const tokens = TOKEN_LIST[s.chain] || [];
+        const list = tokens.map((t,i)=> `${i+1}. ${t.symbol}${t.address?` (${t.address})`:" (native)"}`).join("\\n");
+        s.step = "chooseToken";
+        return sendWhatsAppText(from, `Select token by number OR paste token contract / jetton address:\\n\\n${list}`);
+      }
+      return sendWhatsAppText(from, "Reply with native or token.");
+    }
+    if (s.step === "chooseToken") {
+      const tokens = TOKEN_LIST[s.chain] || [];
+      const n = parseInt(raw, 10);
+      if (!isNaN(n) && n>=1 && n<=tokens.length) {
+        const t = tokens[n-1];
+        s.tokenAddress = t.address;
+        s.tokenSymbol = t.symbol;
+        s.step = "askAmount";
+        return sendWhatsAppText(from, `Enter amount in ${s.tokenSymbol} (e.g., 10.5)`);
+      }
+      if (s.chain !== "ton" && ethers.isAddress(raw)) {
+        s.tokenAddress = raw;
+        try {
+          const provider = providers[s.chain];
+          const contract = new ethers.Contract(raw, ERC20_ABI, provider);
+          s.tokenSymbol = await contract.symbol().catch(()=> "TOKEN");
+        } catch (_) { s.tokenSymbol = "TOKEN"; }
+        s.step = "askAmount";
+        return sendWhatsAppText(from, `Enter amount in ${s.tokenSymbol} (e.g., 10.5)`);
+      }
+      if (s.chain === "ton") {
+        if (!isValidTonAddress(raw)) return sendWhatsAppText(from, "Invalid jetton address.");
+        s.tokenAddress = raw;
+        s.tokenSymbol = "JETTON";
+        s.step = "askAmount";
+        return sendWhatsAppText(from, `Enter amount in ${s.tokenSymbol} (e.g., 10.5)`);
+      }
+      return sendWhatsAppText(from, "Invalid input. Enter token number or paste contract address.");
+    }
+    if (s.step === "askAmount") {
+      const amt = parseFloat(raw);
+      if (isNaN(amt) || amt <= 0) return sendWhatsAppText(from, "Invalid amount.");
+      s.amount = amt;
+      s.step = "confirm";
+      const gasInfo = await estimateGasForTransfer(s.chain, "0x0", "0x0", s.amount, s.tokenAddress).catch(() => null);
+      const feeLine = gasInfo ? `Estimated fee: ${gasInfo.estimatedFeeNative} ${gasInfo.nativeSymbol}` : "Estimated fee: n/a";
+      await sendWhatsAppButtons(from, `Summary\nChain: ${CHAIN_CONFIG[s.chain].name}\nRecipient: ${s.recipient}\nAmount: ${s.amount} ${s.tokenSymbol}\n${feeLine}`, [
+        { id: "wa_send_confirm", title: "Confirm" },
+        { id: "wa_send_cancel", title: "Cancel" }
+      ]);
+      return sendWhatsAppText(from, "Tap a button: Confirm or Cancel.");
+    }
+    if (s.step === "confirm") {
+      if (lower === "cancel") {
+        delete sendStateWA[from];
+        return sendWhatsAppText(from, "Send cancelled.");
+      }
+      if (lower === "confirm") {
+        return requestPINForActionWhatsApp(from, "wa_send_confirm", {});
+      }
+      return sendWhatsAppText(from, "Reply CONFIRM to send or CANCEL to stop.");
+    }
+  }
+
+  if (lower === "help" || lower === "menu") {
+    await sendWhatsAppMenu(from);
+    await sendWhatsAppMenuButtons(from);
+    return sendWhatsAppText(from, "Commands: createwallet | balance [chain] | address [chain] | send [chain] | setpin | ask <question>");
+  }
+
+  if (lower === "setpin") {
+    if (!user.pinHash) {
+      pinSetSessionsWA[from] = { stage: "enter" };
+      return sendWhatsAppText(from, "Enter a new 4-6 digit PIN:");
+    }
+    pinSetSessionsWA[from] = { stage: "verify_old" };
+    return sendWhatsAppText(from, "Enter your current PIN to change it:");
+  }
+
+  if (lower === "createwallet") {
+    for (const chain of SUPPORTED_CHAINS) {
+      await ensureChainWallet(user, chain).catch(err => console.warn("ensureChainWallet", chain, err?.message || err));
+    }
+    const pref = user.preferredChain || SUPPORTED_CHAINS[0];
+    const entry = user.wallets.get(pref);
+    const msg = entry ? `OK. Wallets created. Preferred (${CHAIN_CONFIG[pref].name}): ${entry.address}` : "OK. Wallets created.";
+    return sendWhatsAppText(from, msg);
+  }
+
+  if (lower.startsWith("balance")) {
+    const parts = raw.split(/\s+/);
+    const chain = parts[1] ? parts[1].toLowerCase() : (user.preferredChain || SUPPORTED_CHAINS[0]);
+    if (!isValidChain(chain)) return sendWhatsAppText(from, "Unsupported chain.");
+    await ensureChainWallet(user, chain);
+    const bal = await getChainBalance(user, chain).catch(() => "n/a");
+    return sendWhatsAppText(from, `${CHAIN_CONFIG[chain].name}: ${bal} ${CHAIN_CONFIG[chain].symbol}`);
+  }
+
+  if (lower.startsWith("address")) {
+    const parts = raw.split(/\s+/);
+    const chain = parts[1] ? parts[1].toLowerCase() : (user.preferredChain || SUPPORTED_CHAINS[0]);
+    if (!isValidChain(chain)) return sendWhatsAppText(from, "Unsupported chain.");
+    await ensureChainWallet(user, chain);
+    const entry = user.wallets.get(chain);
+    return sendWhatsAppText(from, `${CHAIN_CONFIG[chain].name} address: ${entry.address}`);
+  }
+
+  if (lower === "send") {
+    await sendWhatsAppChainPicker(from);
+    return sendWhatsAppText(from, "Or type: send <chain> (polygon/bsc/base/ethereum/ton).");
+  }
+
+  if (lower.startsWith("send")) {
+    const parts = raw.split(/\s+/);
+    const chain = parts[1] ? parts[1].toLowerCase() : (user.preferredChain || SUPPORTED_CHAINS[0]);
+    if (!isValidChain(chain)) return sendWhatsAppText(from, "Unsupported chain.");
+    sendStateWA[from] = { chain, step: "askRecipient" };
+    return sendWhatsAppText(from, `Send (${CHAIN_CONFIG[chain].name}) - enter recipient address:`);
+  }
+
+  if (lower.startsWith("ask ")) {
+    const q = raw.slice(4).trim();
+    if (!q) return sendWhatsAppText(from, "Ask a question after 'ask'.");
+    try {
+      const reply = await askCenAI(q);
+      return sendWhatsAppText(from, reply);
+    } catch (e) {
+      console.error("WhatsApp AI error", e);
+      return sendWhatsAppText(from, "AI error. Try again later.");
+    }
+  }
+
+  return sendWhatsAppText(from, "Unknown command. Send 'help' for options.");
+}
+
+app.get("/whatsapp/webhook", (req, res) => {
+  const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN;
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  if (mode && token && mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("WHATSAPP_WEBHOOK_VERIFIED");
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+app.post("/whatsapp/webhook", async (req, res) => {
+  try {
+    const body = req.body;
+    const changes = body?.entry?.[0]?.changes?.[0];
+    const messages = changes?.value?.messages;
+    if (!messages || !messages.length) return res.sendStatus(200);
+    for (const message of messages) {
+      const from = message.from;
+      if (message.type === "interactive") {
+        const id = message.interactive?.list_reply?.id || message.interactive?.button_reply?.id || null;
+        if (id === "wa_send_confirm") { await handleWhatsAppText(from, "confirm"); continue; }
+        if (id === "wa_send_cancel") { await handleWhatsAppText(from, "cancel"); continue; }
+        const mapped = id ? mapWhatsAppMenuIdToText(id) : null;
+        if (mapped) {
+          const text = mapped === "ask" ? "ask " : mapped;
+          await handleWhatsAppText(from, text);
+        } else {
+          await sendWhatsAppText(from, "Send a text message. Type `help` for commands.");
+        }
+        continue;
+      }
+      if (message.type !== "text") {
+        await sendWhatsAppText(from, "Send a text message. Type `help` for commands.");
+        continue;
+      }
+      const text = message.text?.body || "";
+      await handleWhatsAppText(from, text);
+    }
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("WhatsApp webhook error", err);
+    res.sendStatus(500);
+  }
+});
+
 app.get("/", (req, res) => res.send("CenDeFi Bot running"));
 app.listen(WEBHOOK_PORT, () => console.log(`Webhook server listening on port ${WEBHOOK_PORT}`));
 
 console.log("CenDeFi (TON-integrated) bot loaded");
+
